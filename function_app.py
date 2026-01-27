@@ -2,8 +2,11 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
+from azure.storage.blob import BlobServiceClient
+
 
 import azure.functions as func
+import os
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
@@ -59,6 +62,32 @@ def process_will(msg: func.QueueMessage) -> None:
 
     try:
         data = json.loads(raw)
-        logging.info("Parsed job: docId=%s blobName=%s", data.get("docId"), data.get("blobName"))
     except json.JSONDecodeError:
         logging.warning("Queue message was not valid JSON.")
+        return
+
+    doc_id = data.get("docId")
+    blob_name = data.get("blobName")
+    if not blob_name:
+        logging.warning("Missing blobName in message; skipping.")
+        return
+
+    container = os.getenv("RAW_WILLS_CONTAINER", "raw-wills")
+    conn_str = os.getenv("AzureWebJobsStorage")
+    if not conn_str:
+        logging.error("AzureWebJobsStorage is not set.")
+        return
+
+    bsc = BlobServiceClient.from_connection_string(conn_str)
+    blob_client = bsc.get_blob_client(container=container, blob=blob_name)
+
+    logging.info("Downloading blob: container=%s blob=%s docId=%s", container, blob_name, doc_id)
+
+    try:
+        downloader = blob_client.download_blob()
+        content = downloader.readall()
+    except Exception as e:
+        logging.exception("Failed to download blob '%s' from '%s': %s", blob_name, container, e)
+        return
+
+    logging.info("Downloaded %d bytes for docId=%s blobName=%s", len(content), doc_id, blob_name)
