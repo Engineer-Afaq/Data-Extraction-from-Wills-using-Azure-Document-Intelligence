@@ -193,9 +193,11 @@ def upsert_processed_will_from_cu(
     will_date, will_date_conf = _cu_val_conf(raw_fields, "SignatureDate")
 
     if not client_name:
-        raise RuntimeError("Required CU field 'TestatorName' missing → cannot insert (ClientName is NOT NULL).")
+        logging.warning("CU field 'TestatorName' missing; inserting NULL ClientName.")
+
     if not will_date:
-        raise RuntimeError("Required CU field 'SignatureDate' missing → cannot insert (WillDate is NOT NULL).")
+        logging.warning("CU field 'SignatureDate' missing; inserting NULL WillDate.")
+
 
     dob, dob_conf = _cu_val_conf(raw_fields, "TestatorDateOfBirth")
     address, address_conf = _cu_val_conf(raw_fields, "TestatorAddress")
@@ -257,61 +259,102 @@ def upsert_processed_will_from_cu(
 
         # MERGE = UPSERT
         cur.execute(
-            """
-            MERGE dbo.processed_wills AS tgt
-            USING (SELECT ? AS DocId) AS src
-              ON tgt.DocId = src.DocId
-            WHEN MATCHED THEN
-              UPDATE SET
-                SourcePath = ?,
-                ModelVersion = ?,
-                ProcessedUtc = ?,
-                ClientName = ?, ClientName_Confidence = ?,
-                DateOfBirth = ?, DateOfBirth_Confidence = ?,
-                WillDate = ?, WillDate_Confidence = ?,
-                Addresses = ?, Addresses_Confidence = ?,
-                FuneralWishes = ?, FuneralWishes_Confidence = ?,
-                ResiduaryBeneficiaries = ?, ResiduaryBeneficiaries_Confidence = ?,
-                TrustProvisions = ?, TrustProvisions_Confidence = ?,
-                LowConfidenceFlag = ?,
-                LineageRefs = ?
-            WHEN NOT MATCHED THEN
-              INSERT (
-                DocId, SourcePath, ModelVersion, ProcessedUtc,
-                ClientName, ClientName_Confidence,
-                DateOfBirth, DateOfBirth_Confidence,
-                WillDate, WillDate_Confidence,
-                Addresses, Addresses_Confidence,
-                FuneralWishes, FuneralWishes_Confidence,
-                ResiduaryBeneficiaries, ResiduaryBeneficiaries_Confidence,
-                TrustProvisions, TrustProvisions_Confidence,
-                LowConfidenceFlag, LineageRefs
-              )
-              VALUES (?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?);
-            """,
-            (
-                doc_id,
-                source_path,
-                analyzer_id,
-                processed_utc,
-                client_name,
-                client_conf,
-                dob,
-                dob_conf,
-                will_date,
-                will_date_conf,
-                address,
-                address_conf,
-                funeral_wishes,
-                funeral_conf,
-                residuary_benef,
-                residuary_conf,
-                trust_prov,
-                trust_conf,
-                int(low_conf_flag),
-                lineage_refs,
-            ),
-        )
+    """
+    MERGE dbo.processed_wills AS tgt
+    USING (
+        SELECT
+            ? AS DocId,
+            ? AS SourcePath,
+            ? AS ModelVersion,
+            ? AS ProcessedUtc,
+            ? AS ClientName,
+            ? AS ClientName_Confidence,
+            ? AS DateOfBirth,
+            ? AS DateOfBirth_Confidence,
+            ? AS WillDate,
+            ? AS WillDate_Confidence,
+            ? AS Addresses,
+            ? AS Addresses_Confidence,
+            ? AS FuneralWishes,
+            ? AS FuneralWishes_Confidence,
+            ? AS ResiduaryBeneficiaries,
+            ? AS ResiduaryBeneficiaries_Confidence,
+            ? AS TrustProvisions,
+            ? AS TrustProvisions_Confidence,
+            ? AS LowConfidenceFlag,
+            ? AS LineageRefs
+    ) AS src
+      ON tgt.DocId = src.DocId
+    WHEN MATCHED THEN
+      UPDATE SET
+        SourcePath = src.SourcePath,
+        ModelVersion = src.ModelVersion,
+        ProcessedUtc = src.ProcessedUtc,
+        ClientName = src.ClientName,
+        ClientName_Confidence = src.ClientName_Confidence,
+        DateOfBirth = src.DateOfBirth,
+        DateOfBirth_Confidence = src.DateOfBirth_Confidence,
+        WillDate = src.WillDate,
+        WillDate_Confidence = src.WillDate_Confidence,
+        Addresses = src.Addresses,
+        Addresses_Confidence = src.Addresses_Confidence,
+        FuneralWishes = src.FuneralWishes,
+        FuneralWishes_Confidence = src.FuneralWishes_Confidence,
+        ResiduaryBeneficiaries = src.ResiduaryBeneficiaries,
+        ResiduaryBeneficiaries_Confidence = src.ResiduaryBeneficiaries_Confidence,
+        TrustProvisions = src.TrustProvisions,
+        TrustProvisions_Confidence = src.TrustProvisions_Confidence,
+        LowConfidenceFlag = src.LowConfidenceFlag,
+        LineageRefs = src.LineageRefs
+    WHEN NOT MATCHED THEN
+      INSERT (
+        DocId, SourcePath, ModelVersion, ProcessedUtc,
+        ClientName, ClientName_Confidence,
+        DateOfBirth, DateOfBirth_Confidence,
+        WillDate, WillDate_Confidence,
+        Addresses, Addresses_Confidence,
+        FuneralWishes, FuneralWishes_Confidence,
+        ResiduaryBeneficiaries, ResiduaryBeneficiaries_Confidence,
+        TrustProvisions, TrustProvisions_Confidence,
+        LowConfidenceFlag, LineageRefs
+      )
+      VALUES (
+        src.DocId, src.SourcePath, src.ModelVersion, src.ProcessedUtc,
+        src.ClientName, src.ClientName_Confidence,
+        src.DateOfBirth, src.DateOfBirth_Confidence,
+        src.WillDate, src.WillDate_Confidence,
+        src.Addresses, src.Addresses_Confidence,
+        src.FuneralWishes, src.FuneralWishes_Confidence,
+        src.ResiduaryBeneficiaries, src.ResiduaryBeneficiaries_Confidence,
+        src.TrustProvisions, src.TrustProvisions_Confidence,
+        src.LowConfidenceFlag, src.LineageRefs
+      );
+    """,
+    (
+        doc_id,
+        source_path,
+        analyzer_id,
+        processed_utc,
+        client_name,
+        client_conf,
+        dob,
+        dob_conf,
+        will_date,
+        will_date_conf,
+        address,
+        address_conf,
+        funeral_wishes,
+        funeral_conf,
+        residuary_benef,
+        residuary_conf,
+        trust_prov,
+        trust_conf,
+        int(low_conf_flag),
+        lineage_refs,
+    ),
+)
+
+
 
         conn.commit()
 
