@@ -1,4 +1,8 @@
-import base64
+# File path (Azure Functions Python v2 programming model):
+#   <your-function-app-project>/function_app.py
+#
+# Paste this whole file into function_app.py (replacing your current one).
+
 import json
 import logging
 import os
@@ -13,7 +17,6 @@ import requests
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
-
 # -----------------------------
 # Azure Functions app
 # -----------------------------
@@ -26,9 +29,21 @@ _CU_SCOPE = "https://cognitiveservices.azure.com/.default"
 
 
 def _get_cu_headers(content_type: str | None = None) -> dict:
-    cred = DefaultAzureCredential()
-    token = cred.get_token(_CU_SCOPE).token
-    headers = {"Authorization": f"Bearer {token}"}
+    """
+    Uses your existing setting names:
+      - If CU_KEY is set -> uses Ocp-Apim-Subscription-Key (API key auth)
+      - Else -> uses Managed Identity via DefaultAzureCredential (Bearer token)
+
+    NOTE: No variable renames needed anywhere else.
+    """
+    key = os.getenv("CU_KEY")
+    if key:
+        headers = {"Ocp-Apim-Subscription-Key": key}
+    else:
+        cred = DefaultAzureCredential()
+        token = cred.get_token(_CU_SCOPE).token
+        headers = {"Authorization": f"Bearer {token}"}
+
     if content_type:
         headers["Content-Type"] = content_type
     return headers
@@ -36,23 +51,22 @@ def _get_cu_headers(content_type: str | None = None) -> dict:
 
 def cu_analyze_binary(endpoint: str, analyzer_id: str, content: bytes, api_version: str) -> str:
     """
-    Starts analysis. Returns the Operation-Location URL to poll.
+    Starts analysis and returns the Operation-Location URL to poll.
 
-    GA 2025-11-01: analyzeBinary expects the request body to be a base64-encoded JSON string.
+    IMPORTANT FIX:
+    :analyzeBinary expects RAW BYTES (application/octet-stream) in the request body.
+    Do NOT base64-wrap the PDF in JSON.
     """
     url = f"{endpoint.rstrip('/')}/contentunderstanding/analyzers/{analyzer_id}:analyzeBinary"
 
-    b64 = base64.b64encode(content).decode("ascii")
-    body = json.dumps(b64)  # JSON string
-
-    headers = _get_cu_headers(content_type="application/json")
+    headers = _get_cu_headers(content_type="application/octet-stream")
     headers["x-ms-client-request-id"] = str(uuid.uuid4())
 
     resp = requests.post(
         url,
         params={"api-version": api_version},
         headers=headers,
-        data=body,
+        data=content,  # <-- raw PDF bytes
         timeout=180,
     )
 
@@ -94,10 +108,12 @@ def cu_poll_result(operation_location: str, timeout_s: int = 240, poll_interval_
 # Helpers: CU field extraction
 # -----------------------------
 def extract_field_value(field_obj):
-    """
-    Generic field flattener for CU response fields.
-    """
-    t = (field_obj or {}).get("type")
+    if not field_obj or not isinstance(field_obj, dict):
+        return None
+
+    t = field_obj.get("type")
+
+    # Normal typed paths
     if t == "string":
         return field_obj.get("valueString")
     if t == "date":
@@ -118,6 +134,12 @@ def extract_field_value(field_obj):
     if t == "array":
         arr = field_obj.get("valueArray") or []
         return [extract_field_value(v) for v in arr]
+
+    # Fallbacks (covers variations in CU payloads)
+    for k in ("valueString", "valueDate", "valueNumber", "valueInteger", "valueBoolean", "content", "text", "value"):
+        if k in field_obj and field_obj.get(k) not in (None, ""):
+            return field_obj.get(k)
+
     return None
 
 
@@ -172,32 +194,19 @@ def upsert_processed_will_from_cu(
     extracted_path: str,
     curated_path: str,
 ) -> None:
-    """
-    Writes into dbo.processed_wills using YOUR analyzer field keys.
-
-    CU Field Keys (from your analyzer schema):
-      - TestatorName -> ClientName
-      - TestatorDateOfBirth -> DateOfBirth
-      - SignatureDate -> WillDate
-      - TestatorAddress -> Addresses
-      - FuneralPreference + FuneralDonationRequest -> FuneralWishes
-      - ResidueBeneficiaryPrimary (+ survivorship/method) -> ResiduaryBeneficiaries
-      - TrusteePowers + TrusteeAdministrativeProvisions -> TrustProvisions
-    """
     contents = (result_payload.get("result") or {}).get("contents") or []
     first = contents[0] if contents else {}
     raw_fields = first.get("fields") or {}
+    logging.warning("CU raw_fields keys: %s", list(raw_fields.keys()))
 
     # Required per your SQL schema
     client_name, client_conf = _cu_val_conf(raw_fields, "TestatorName")
     will_date, will_date_conf = _cu_val_conf(raw_fields, "SignatureDate")
 
-    if not client_name:
+    if client_name is None:
         logging.warning("CU field 'TestatorName' missing; inserting NULL ClientName.")
-
-    if not will_date:
+    if will_date is None:
         logging.warning("CU field 'SignatureDate' missing; inserting NULL WillDate.")
-
 
     dob, dob_conf = _cu_val_conf(raw_fields, "TestatorDateOfBirth")
     address, address_conf = _cu_val_conf(raw_fields, "TestatorAddress")
@@ -211,6 +220,9 @@ def upsert_processed_will_from_cu(
 
     trustee_powers, trustee_powers_conf = _cu_val_conf(raw_fields, "TrusteePowers")
     trustee_admin, trustee_admin_conf = _cu_val_conf(raw_fields, "TrusteeAdministrativeProvisions")
+
+    logging.warning("TestatorName raw: %s", json.dumps(raw_fields.get("TestatorName"), ensure_ascii=False))
+    logging.warning("SignatureDate raw: %s", json.dumps(raw_fields.get("SignatureDate"), ensure_ascii=False))
 
     # Build combined SQL fields
     funeral_wishes = "\n".join([x for x in [funeral_pref, funeral_don] if x]) or None
@@ -256,106 +268,101 @@ def upsert_processed_will_from_cu(
 
     with _sql_connect() as conn:
         cur = conn.cursor()
-
-        # MERGE = UPSERT
         cur.execute(
-    """
-    MERGE dbo.processed_wills AS tgt
-    USING (
-        SELECT
-            ? AS DocId,
-            ? AS SourcePath,
-            ? AS ModelVersion,
-            ? AS ProcessedUtc,
-            ? AS ClientName,
-            ? AS ClientName_Confidence,
-            ? AS DateOfBirth,
-            ? AS DateOfBirth_Confidence,
-            ? AS WillDate,
-            ? AS WillDate_Confidence,
-            ? AS Addresses,
-            ? AS Addresses_Confidence,
-            ? AS FuneralWishes,
-            ? AS FuneralWishes_Confidence,
-            ? AS ResiduaryBeneficiaries,
-            ? AS ResiduaryBeneficiaries_Confidence,
-            ? AS TrustProvisions,
-            ? AS TrustProvisions_Confidence,
-            ? AS LowConfidenceFlag,
-            ? AS LineageRefs
-    ) AS src
-      ON tgt.DocId = src.DocId
-    WHEN MATCHED THEN
-      UPDATE SET
-        SourcePath = src.SourcePath,
-        ModelVersion = src.ModelVersion,
-        ProcessedUtc = src.ProcessedUtc,
-        ClientName = src.ClientName,
-        ClientName_Confidence = src.ClientName_Confidence,
-        DateOfBirth = src.DateOfBirth,
-        DateOfBirth_Confidence = src.DateOfBirth_Confidence,
-        WillDate = src.WillDate,
-        WillDate_Confidence = src.WillDate_Confidence,
-        Addresses = src.Addresses,
-        Addresses_Confidence = src.Addresses_Confidence,
-        FuneralWishes = src.FuneralWishes,
-        FuneralWishes_Confidence = src.FuneralWishes_Confidence,
-        ResiduaryBeneficiaries = src.ResiduaryBeneficiaries,
-        ResiduaryBeneficiaries_Confidence = src.ResiduaryBeneficiaries_Confidence,
-        TrustProvisions = src.TrustProvisions,
-        TrustProvisions_Confidence = src.TrustProvisions_Confidence,
-        LowConfidenceFlag = src.LowConfidenceFlag,
-        LineageRefs = src.LineageRefs
-    WHEN NOT MATCHED THEN
-      INSERT (
-        DocId, SourcePath, ModelVersion, ProcessedUtc,
-        ClientName, ClientName_Confidence,
-        DateOfBirth, DateOfBirth_Confidence,
-        WillDate, WillDate_Confidence,
-        Addresses, Addresses_Confidence,
-        FuneralWishes, FuneralWishes_Confidence,
-        ResiduaryBeneficiaries, ResiduaryBeneficiaries_Confidence,
-        TrustProvisions, TrustProvisions_Confidence,
-        LowConfidenceFlag, LineageRefs
-      )
-      VALUES (
-        src.DocId, src.SourcePath, src.ModelVersion, src.ProcessedUtc,
-        src.ClientName, src.ClientName_Confidence,
-        src.DateOfBirth, src.DateOfBirth_Confidence,
-        src.WillDate, src.WillDate_Confidence,
-        src.Addresses, src.Addresses_Confidence,
-        src.FuneralWishes, src.FuneralWishes_Confidence,
-        src.ResiduaryBeneficiaries, src.ResiduaryBeneficiaries_Confidence,
-        src.TrustProvisions, src.TrustProvisions_Confidence,
-        src.LowConfidenceFlag, src.LineageRefs
-      );
-    """,
-    (
-        doc_id,
-        source_path,
-        analyzer_id,
-        processed_utc,
-        client_name,
-        client_conf,
-        dob,
-        dob_conf,
-        will_date,
-        will_date_conf,
-        address,
-        address_conf,
-        funeral_wishes,
-        funeral_conf,
-        residuary_benef,
-        residuary_conf,
-        trust_prov,
-        trust_conf,
-        int(low_conf_flag),
-        lineage_refs,
-    ),
-)
-
-
-
+            """
+            MERGE dbo.processed_wills AS tgt
+            USING (
+                SELECT
+                    ? AS DocId,
+                    ? AS SourcePath,
+                    ? AS ModelVersion,
+                    ? AS ProcessedUtc,
+                    ? AS ClientName,
+                    ? AS ClientName_Confidence,
+                    ? AS DateOfBirth,
+                    ? AS DateOfBirth_Confidence,
+                    ? AS WillDate,
+                    ? AS WillDate_Confidence,
+                    ? AS Addresses,
+                    ? AS Addresses_Confidence,
+                    ? AS FuneralWishes,
+                    ? AS FuneralWishes_Confidence,
+                    ? AS ResiduaryBeneficiaries,
+                    ? AS ResiduaryBeneficiaries_Confidence,
+                    ? AS TrustProvisions,
+                    ? AS TrustProvisions_Confidence,
+                    ? AS LowConfidenceFlag,
+                    ? AS LineageRefs
+            ) AS src
+              ON tgt.DocId = src.DocId
+            WHEN MATCHED THEN
+              UPDATE SET
+                SourcePath = src.SourcePath,
+                ModelVersion = src.ModelVersion,
+                ProcessedUtc = src.ProcessedUtc,
+                ClientName = src.ClientName,
+                ClientName_Confidence = src.ClientName_Confidence,
+                DateOfBirth = src.DateOfBirth,
+                DateOfBirth_Confidence = src.DateOfBirth_Confidence,
+                WillDate = src.WillDate,
+                WillDate_Confidence = src.WillDate_Confidence,
+                Addresses = src.Addresses,
+                Addresses_Confidence = src.Addresses_Confidence,
+                FuneralWishes = src.FuneralWishes,
+                FuneralWishes_Confidence = src.FuneralWishes_Confidence,
+                ResiduaryBeneficiaries = src.ResiduaryBeneficiaries,
+                ResiduaryBeneficiaries_Confidence = src.ResiduaryBeneficiaries_Confidence,
+                TrustProvisions = src.TrustProvisions,
+                TrustProvisions_Confidence = src.TrustProvisions_Confidence,
+                LowConfidenceFlag = src.LowConfidenceFlag,
+                LineageRefs = src.LineageRefs
+            WHEN NOT MATCHED THEN
+              INSERT (
+                DocId, SourcePath, ModelVersion, ProcessedUtc,
+                ClientName, ClientName_Confidence,
+                DateOfBirth, DateOfBirth_Confidence,
+                WillDate, WillDate_Confidence,
+                Addresses, Addresses_Confidence,
+                FuneralWishes, FuneralWishes_Confidence,
+                ResiduaryBeneficiaries, ResiduaryBeneficiaries_Confidence,
+                TrustProvisions, TrustProvisions_Confidence,
+                LowConfidenceFlag, LineageRefs
+              )
+              VALUES (
+                src.DocId, src.SourcePath, src.ModelVersion, src.ProcessedUtc,
+                src.ClientName, src.ClientName_Confidence,
+                src.DateOfBirth, src.DateOfBirth_Confidence,
+                src.WillDate, src.WillDate_Confidence,
+                src.Addresses, src.Addresses_Confidence,
+                src.FuneralWishes, src.FuneralWishes_Confidence,
+                src.ResiduaryBeneficiaries, src.ResiduaryBeneficiaries_Confidence,
+                src.TrustProvisions, src.TrustProvisions_Confidence,
+                src.LowConfidenceFlag, src.LineageRefs
+              );
+            """,
+            (
+                doc_id,
+                source_path,
+                analyzer_id,
+                processed_utc,
+                client_name,
+                client_conf,
+                dob,
+                dob_conf,
+                will_date,
+                will_date_conf,
+                address,
+                address_conf,
+                funeral_wishes,
+                funeral_conf,
+                residuary_benef,
+                residuary_conf,
+                trust_prov,
+                trust_conf,
+                int(low_conf_flag),
+                lineage_refs,
+            ),
+        )
         conn.commit()
 
 
@@ -447,7 +454,8 @@ def process_will(msg: func.QueueMessage) -> None:
     logging.info("Downloaded %d bytes for docId=%s blobName=%s", len(content), doc_id, blob_name)
 
     # --- Call Content Understanding ---
-    endpoint = os.getenv("DOCINTEL_ENDPOINT")
+    # (Keep your existing variable names; just make sure you set them in local.settings.json / app settings.)
+    endpoint = os.getenv("DOCINTEL_ENDPOINT")  # e.g. https://<resource>.services.ai.azure.com
     analyzer_id = os.getenv("DOCINTEL_ANALYZER_ID", "Wills_Analysis")
     api_version = os.getenv("CU_API_VERSION", "2025-11-01")
 
