@@ -247,4 +247,3 @@ Choose one:
 - MIT
 - Apache-2.0
 
-(Place the chosen license text into `LICENSE`.)
