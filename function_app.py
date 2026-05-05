@@ -1,7 +1,4 @@
-# File path (Azure Functions Python v2 programming model):
-#   <your-function-app-project>/function_app.py
-#
-# Paste this whole file into function_app.py (replacing your current one).
+
 
 import json
 import logging
@@ -453,8 +450,8 @@ def process_will(msg: func.QueueMessage) -> None:
     content = downloader.readall()
     logging.info("Downloaded %d bytes for docId=%s blobName=%s", len(content), doc_id, blob_name)
 
-    # --- Call Content Understanding ---
-    # (Keep your existing variable names; just make sure you set them in local.settings.json / app settings.)
+    # --- Calling Content Understanding ---
+  
     endpoint = os.getenv("DOCINTEL_ENDPOINT")  # e.g. https://<resource>.services.ai.azure.com
     analyzer_id = os.getenv("DOCINTEL_ANALYZER_ID", "Wills_Analysis")
     api_version = os.getenv("CU_API_VERSION", "2025-11-01")
